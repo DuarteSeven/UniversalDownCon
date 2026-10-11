@@ -22,7 +22,7 @@ def detect_file_category(filepath: str) -> str:
     return 'unknown'
 
 def _has_audio_stream(input_file: str, startupinfo=None) -> bool:
-    """Checks whether the media file contains an audio stream."""
+    """Verifica se o ficheiro contém um fluxo de áudio."""
     cmd = [
         'ffprobe', '-v', 'error',
         '-select_streams', 'a',
@@ -37,7 +37,7 @@ def _has_audio_stream(input_file: str, startupinfo=None) -> bool:
         return False
 
 def _get_duration(input_file: str, startupinfo=None) -> float:
-    """Extracts duration in seconds."""
+    """Extrai a duração do vídeo em segundos."""
     probe_cmd = [
         'ffprobe', '-v', 'error',
         '-show_entries', 'format=duration',
@@ -49,10 +49,12 @@ def _get_duration(input_file: str, startupinfo=None) -> float:
     except Exception:
         return 0.0
 
-def compress_video_to_size(input_file: str, target_mb: float = 19.0) -> str:
+def compress_video_to_size(input_file: str, target_mb: float = 19.0, gif_mode: str = "quality") -> str:
     """
-    Compresses an entire video (even 1h30+ long) to strictly stay below target_mb.
-    If the file is a GIF, reduces resolution and framerate iteratively.
+    Comprime vídeos ou GIFs para ficarem estritamente abaixo de target_mb.
+    Para GIFs:
+      - 'quality': Mantém FPS altos e fluidez, reduzindo resolução/cores.
+      - 'frames': Mantém nitidez/resolução, reduzindo a taxa de fotogramas.
     """
     if not os.path.isfile(input_file):
         return input_file
@@ -68,37 +70,56 @@ def compress_video_to_size(input_file: str, target_mb: float = 19.0) -> str:
 
     ext = os.path.splitext(input_file)[1].lower()
 
-    # --- SPECIAL HANDLING FOR GIF COMPRESSION ---
+    # --- COMPRESSÃO DE GIF ---
     if ext == '.gif':
-        # Scale resolution and framerate down until it hits the target size
         base = os.path.splitext(input_file)[0]
         temp_gif = f"{base}_temp_comp.gif"
-        for scale, fps in [(360, 10), (280, 8), (200, 6), (160, 5)]:
-            vf = f"fps={fps},scale={scale}:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
+
+        if gif_mode == "frames":
+            profiles = [
+                {"fps": 15, "scale": 480, "max_colors": 256},
+                {"fps": 12, "scale": 420, "max_colors": 192},
+                {"fps": 10, "scale": 380, "max_colors": 128},
+                {"fps": 8,  "scale": 320, "max_colors": 96},
+                {"fps": 6,  "scale": 280, "max_colors": 64},
+            ]
+        else:
+            # Modo 'quality' (Fluidez prioritária)
+            profiles = [
+                {"fps": 24, "scale": 380, "max_colors": 128},
+                {"fps": 20, "scale": 320, "max_colors": 96},
+                {"fps": 18, "scale": 260, "max_colors": 64},
+                {"fps": 16, "scale": 200, "max_colors": 48},
+            ]
+
+        for p in profiles:
+            vf = (
+                f"fps={p['fps']},scale={p['scale']}:-1:flags=lanczos,"
+                f"split[s0][s1];"
+                f"[s0]palettegen=max_colors={p['max_colors']}:stats_mode=diff[p];"
+                f"[s1][p]paletteuse=dither=bayer:bayer_scale=3"
+            )
             subprocess.run([
                 'ffmpeg', '-y', '-i', input_file,
                 '-vf', vf, temp_gif
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, startupinfo=startupinfo)
-            
+
             if os.path.exists(temp_gif) and (os.path.getsize(temp_gif) / (1024 * 1024)) <= target_mb:
                 break
-        
+
         if os.path.exists(temp_gif) and os.path.getsize(temp_gif) > 0:
             os.replace(temp_gif, input_file)
         return input_file
 
-    # --- VIDEO (MP4/MKV/WEBM) 2-PASS COMPRESSION ---
+    # --- COMPRESSÃO DE VÍDEO (2-PASS) ---
     duration = _get_duration(input_file, startupinfo)
     if duration <= 0:
         return input_file
 
     has_audio = _has_audio_stream(input_file, startupinfo)
-
-    # Reserve 85% for safer headroom against container muxing variance
     target_total_kbps = (target_mb * 8192 * 0.85) / duration
 
     if has_audio:
-        # Scale down audio bitrate if video is long to reserve budget for video
         if target_total_kbps < 200:
             audio_kbps = 48
         elif target_total_kbps < 400:
@@ -110,8 +131,6 @@ def compress_video_to_size(input_file: str, target_mb: float = 19.0) -> str:
         audio_kbps = 0
         video_kbps = max(int(target_total_kbps), 45)
 
-    # Automatically downscale resolution if the bitrate budget is too low (e.g. 1h30 video)
-    # This prevents the encoder from dropping frames or corrupting long videos!
     scale_filter = []
     if video_kbps < 150:
         scale_filter = ['-vf', 'scale=-2:360']
@@ -146,11 +165,10 @@ def compress_video_to_size(input_file: str, target_mb: float = 19.0) -> str:
         pass2_cmd.extend(['-c:a', 'aac', '-b:a', f'{audio_kbps}k'])
     else:
         pass2_cmd.append('-an')
-        
+
     pass2_cmd.append(output_temp)
     subprocess.run(pass2_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, startupinfo=startupinfo)
 
-    # Cleanup FFmpeg 2-pass logs
     for log_f in ['ffmpeg2pass-0.log', 'ffmpeg2pass-0.log.mbtree']:
         if os.path.exists(log_f):
             try:
@@ -160,7 +178,6 @@ def compress_video_to_size(input_file: str, target_mb: float = 19.0) -> str:
 
     if os.path.exists(output_temp) and os.path.getsize(output_temp) > 0:
         try:
-            # Overwrite original output with compressed file
             os.replace(output_temp, input_file)
         except Exception:
             pass
@@ -169,7 +186,7 @@ def compress_video_to_size(input_file: str, target_mb: float = 19.0) -> str:
 
 def convert_media(input_path: str, output_dir: str, target_format: str, progress_callback=None) -> str:
     """
-    Standard conversion maintaining maximum fidelity / lossless where possible.
+    Conversão com fidelidade máxima. Sem compressão ativa, preserva todos os fotogramas.
     """
     if not os.path.isfile(input_path):
         raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -179,13 +196,12 @@ def convert_media(input_path: str, output_dir: str, target_format: str, progress
     target_format = target_format.lower().lstrip('.')
     output_path = os.path.join(output_dir, f"{base_name}.{target_format}")
 
-    # Handle same-format conversion in same folder (e.g. mp4 -> mp4)
     if os.path.abspath(input_path) == os.path.abspath(output_path):
         output_path = os.path.join(output_dir, f"{base_name}_converted.{target_format}")
 
     category = detect_file_category(input_path)
 
-    # --- IMAGE CONVERSION ---
+    # --- IMAGEM ---
     if category == 'image':
         with Image.open(input_path) as img:
             if target_format in ['jpg', 'jpeg', 'bmp'] and img.mode in ('RGBA', 'LA', 'P'):
@@ -199,7 +215,7 @@ def convert_media(input_path: str, output_dir: str, target_format: str, progress
                 img.save(output_path)
         return output_path
 
-    # --- AUDIO CONVERSION ---
+    # --- ÁUDIO ---
     elif category == 'audio':
         cmd = ['ffmpeg', '-y', '-i', input_path, '-vn']
         if target_format == 'mp3':
@@ -214,12 +230,13 @@ def convert_media(input_path: str, output_dir: str, target_format: str, progress
             cmd.extend(['-c:a', 'aac', '-b:a', '256k'])
         cmd.append(output_path)
 
-    # --- VIDEO CONVERSION ---
+    # --- VÍDEO & GIF ---
     elif category == 'video':
         cmd = ['ffmpeg', '-y', '-i', input_path]
         if target_format == 'gif':
+            # Sem limitação de fps -> preserva todos os fotogramas originais para fluidez total
             cmd.extend([
-                '-vf', 'fps=15,scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse',
+                '-vf', 'split[s0][s1];[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3',
                 output_path
             ])
         else:
@@ -233,7 +250,7 @@ def convert_media(input_path: str, output_dir: str, target_format: str, progress
                 cmd.extend(['-c:v', 'copy', '-c:a', 'copy'])
             cmd.append(output_path)
     else:
-        raise ValueError(f"Unsupported format: {os.path.splitext(input_path)[1]}")
+        raise ValueError(f"Formato não suportado: {os.path.splitext(input_path)[1]}")
 
     startupinfo = None
     if os.name == 'nt':

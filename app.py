@@ -14,6 +14,7 @@ import pystray
 # Suporte a registo do Windows para arranque automático
 if os.name == 'nt':
     import winreg
+    import ctypes
 
 # TkinterDnD integration para drag-and-drop
 try:
@@ -38,7 +39,6 @@ STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 APP_NAME = "MediaHub"
 
 
-# Carregar e gravar configurações de utilizador
 def load_config():
     default_dir = os.path.expanduser("~/Downloads")
     default_config = {
@@ -73,10 +73,8 @@ def set_windows_startup(enable: bool):
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_KEY, 0, winreg.KEY_SET_VALUE)
         if enable:
             if getattr(sys, 'frozen', False):
-                # Se for executável PyInstaller
                 exe_path = f'"{sys.executable}" --minimized'
             else:
-                # Se estiver a correr via script Python
                 exe_path = f'"{sys.executable}" "{os.path.abspath(__file__)}" --minimized'
             winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, exe_path)
         else:
@@ -89,7 +87,32 @@ def set_windows_startup(enable: bool):
         print("Erro ao definir arranque no registo:", e)
 
 
-# Classe híbrida para Drag-and-Drop
+def register_start_menu_shortcut():
+    """Cria o atalho no Menu Iniciar para indexação do Windows."""
+    if os.name != 'nt':
+        return
+    start_menu = os.path.join(os.environ.get('APPDATA', ''), r'Microsoft\Windows\Start Menu\Programs')
+    shortcut_path = os.path.join(start_menu, "MediaHub.lnk")
+    if os.path.exists(shortcut_path):
+        return
+
+    target = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
+    work_dir = os.path.dirname(target)
+    ps_cmd = (
+        f'$WshShell = New-Object -ComObject WScript.Shell; '
+        f'$Shortcut = $WshShell.CreateShortcut("{shortcut_path}"); '
+        f'$Shortcut.TargetPath = "{target}"; '
+        f'$Shortcut.WorkingDirectory = "{work_dir}"; '
+        f'$Shortcut.Save()'
+    )
+    try:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        subprocess.run(['powershell', '-WindowStyle', 'Hidden', '-Command', ps_cmd], startupinfo=startupinfo)
+    except Exception:
+        pass
+
+
 if HAS_DND:
     class BaseWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         def __init__(self, *args, **kwargs):
@@ -109,6 +132,9 @@ class MediaApp(BaseWindow):
         self.title("Media Hub: Downloader & Converter")
         self.geometry("740x660")
         self.resizable(False, False)
+
+        # Registo do atalho do Windows
+        register_start_menu_shortcut()
 
         # Pastas configuradas de forma independente
         self.dl_folder = self.config.get("dl_folder", os.path.expanduser("~/Downloads"))
@@ -131,27 +157,38 @@ class MediaApp(BaseWindow):
         self._setup_converter_tab()
         self._setup_settings_tab()
 
-        # Drag and Drop
         if HAS_DND:
             self.drop_target_register(DND_FILES)
             self.dnd_bind('<<Drop>>', self._on_file_drop)
 
-        # Intercetar clique no fechar janela (X)
         self.protocol("WM_DELETE_WINDOW", self._on_close_window)
 
-        # Inicializar Ícone do System Tray
         self.tray_icon = None
         self._init_system_tray()
 
-        # Iniciar minimizado se requisitado (ex: arranque do Windows)
         if start_minimized or (self.start_minimized_var.get() and "--minimized" in sys.argv):
             self.withdraw()
+            self._trim_memory()
 
     # ==========================================
-    # SYSTEM TRAY & PERSISTÊNCIA
+    # MEMÓRIA & SYSTEM TRAY
     # ==========================================
+    def _trim_memory(self):
+        """Liberta páginas de memória inativas no Windows de forma segura."""
+        is_busy = (
+            self.dl_btn.cget("text") == "A processar..." or
+            self.conv_btn.cget("text") == "A converter..."
+        )
+        if is_busy:
+            return
+
+        if os.name == 'nt':
+            try:
+                ctypes.windll.psapi.EmptyWorkingSet(ctypes.windll.kernel32.GetCurrentProcess())
+            except Exception:
+                pass
+
     def _create_tray_image(self):
-        """Cria um ícone dinâmico azul de 64x64 para o System Tray."""
         img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
         draw.rounded_rectangle((4, 4, 60, 60), radius=16, fill="#1f538d")
@@ -202,7 +239,8 @@ class MediaApp(BaseWindow):
 
     def _on_close_window(self):
         if self.minimize_to_tray_var.get():
-            self.withdraw()  # Esconde a janela para a barra de tarefas junto ao relógio
+            self.withdraw()
+            self._trim_memory()
         else:
             self._quit_app()
 
@@ -507,11 +545,13 @@ class MediaApp(BaseWindow):
         self.dl_btn.configure(state="normal", text="Descarregar Média")
         self.dl_status_label.configure(text="Download Concluído!", text_color="#2ecc71")
         self.dl_progress.set(1.0)
+        self._trim_memory()
         messagebox.showinfo("Sucesso", "Download terminado com sucesso!")
 
     def _on_dl_error(self, err):
         self.dl_btn.configure(state="normal", text="Descarregar Média")
         self.dl_status_label.configure(text="Erro no Download", text_color="#e74c3c")
+        self._trim_memory()
         messagebox.showerror("Erro", err)
 
     # ==========================================
@@ -530,11 +570,25 @@ class MediaApp(BaseWindow):
         self.conv_file_label.pack(side="left", fill="x", expand=True, padx=10, pady=8)
         ctk.CTkButton(file_frame, text="Escolher Ficheiro", width=120, command=self._select_convert_file).pack(side="right", padx=10, pady=8)
 
-        conv_opt_frame = ctk.CTkFrame(parent)
-        conv_opt_frame.pack(fill="x", padx=15, pady=5)
-        ctk.CTkLabel(conv_opt_frame, text="Formato Alvo:").pack(side="left", padx=10, pady=8)
-        self.conv_target_format = ctk.CTkOptionMenu(conv_opt_frame, values=["Selecione um ficheiro primeiro"])
-        self.conv_target_format.pack(side="left", padx=10, pady=8)
+        # Formato e Opção contextual de GIF
+        self.conv_opt_frame = ctk.CTkFrame(parent)
+        self.conv_opt_frame.pack(fill="x", padx=15, pady=5)
+
+        ctk.CTkLabel(self.conv_opt_frame, text="Formato Alvo:").pack(side="left", padx=(10, 5), pady=8)
+        self.conv_target_format = ctk.CTkOptionMenu(
+            self.conv_opt_frame,
+            values=["Selecione um ficheiro primeiro"],
+            command=self._on_conv_format_changed
+        )
+        self.conv_target_format.pack(side="left", padx=5, pady=8)
+
+        # Seletor contextual de compressão para GIFs
+        self.conv_gif_mode_menu = ctk.CTkOptionMenu(
+            self.conv_opt_frame,
+            values=["Compress Quality", "Compress Frames"],
+            width=150
+        )
+        self.conv_gif_mode_menu.set("Compress Quality")
 
         # Compressão (Converter)
         conv_comp_frame = ctk.CTkFrame(parent)
@@ -592,6 +646,19 @@ class MediaApp(BaseWindow):
         self.conv_btn = ctk.CTkButton(parent, text="Converter Ficheiro", font=ctk.CTkFont(weight="bold"), height=38, command=self._start_conversion)
         self.conv_btn.pack(fill="x", padx=15, pady=10)
 
+    def _update_gif_mode_visibility(self):
+        """Mostra a opção de Compress Quality/Frames apenas se for GIF e estiver a comprimir."""
+        is_gif = self.conv_target_format.get().lower() == "gif"
+        is_comp = self.conv_compress_var.get()
+
+        if is_gif and is_comp:
+            self.conv_gif_mode_menu.pack(side="left", padx=10, pady=8)
+        else:
+            self.conv_gif_mode_menu.pack_forget()
+
+    def _on_conv_format_changed(self, choice):
+        self._update_gif_mode_visibility()
+
     def _browse_conv_folder(self):
         folder = filedialog.askdirectory(initialdir=self.conv_folder)
         if folder:
@@ -604,6 +671,7 @@ class MediaApp(BaseWindow):
         active = self.conv_compress_var.get()
         self.conv_slider.configure(state="normal" if active else "disabled")
         self.conv_size_label.configure(text_color="white" if active else "gray50")
+        self._update_gif_mode_visibility()
 
     def _on_conv_slider_change(self, val):
         self.conv_size_label.configure(text=f"{int(val)} MB")
@@ -628,6 +696,7 @@ class MediaApp(BaseWindow):
 
         self.conv_target_format.configure(values=options)
         self.conv_target_format.set(options[0])
+        self._update_gif_mode_visibility()
 
     def _select_convert_file(self):
         file_path = filedialog.askopenfilename()
@@ -663,7 +732,9 @@ class MediaApp(BaseWindow):
             if detect_file_category(out_file) == 'video' and self.conv_compress_var.get():
                 target_mb = float(self.conv_slider.get())
                 self.after(0, lambda: self.conv_status_label.configure(text=f"A comprimir para < {int(target_mb)}MB..."))
-                compress_video_to_size(out_file, target_mb=target_mb)
+                
+                gif_mode = "frames" if self.conv_gif_mode_menu.get() == "Compress Frames" else "quality"
+                compress_video_to_size(out_file, target_mb=target_mb, gif_mode=gif_mode)
 
             self.after(0, lambda: self._on_conv_success(out_file))
         except Exception as e:
@@ -672,34 +743,33 @@ class MediaApp(BaseWindow):
     def _on_conv_success(self, out_file):
         self.conv_btn.configure(state="normal", text="Converter Ficheiro")
         self.conv_status_label.configure(text="Convertido com sucesso!", text_color="#2ecc71")
+        self._trim_memory()
         messagebox.showinfo("Sucesso", f"Ficheiro guardado em:\n{out_file}")
 
     def _on_conv_error(self, err):
         self.conv_btn.configure(state="normal", text="Converter Ficheiro")
         self.conv_status_label.configure(text="Erro na conversão.", text_color="#e74c3c")
+        self._trim_memory()
         messagebox.showerror("Erro na Conversão", err)
 
     # ==========================================
-    # TAB 3: DEFINIÇÕES (PASTAS & COMPORTAMENTO)
+    # TAB 3: DEFINIÇÕES
     # ==========================================
     def _setup_settings_tab(self):
         parent = self.tab_settings
 
         ctk.CTkLabel(parent, text="Definições da Aplicação", font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(10, 15))
 
-        # Secção de Pastas Padrão
         paths_group = ctk.CTkFrame(parent)
         paths_group.pack(fill="x", padx=15, pady=8)
 
         ctk.CTkLabel(paths_group, text="Pastas Padrão (Independentes)", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, columnspan=3, padx=10, pady=8, sticky="w")
 
-        # Downloader Folder
         ctk.CTkLabel(paths_group, text="Downloader:").grid(row=1, column=0, padx=10, pady=6, sticky="w")
         self.settings_dl_label = ctk.CTkLabel(paths_group, text=self._shorten_path(self.dl_folder), text_color="gray80")
         self.settings_dl_label.grid(row=1, column=1, padx=5, pady=6, sticky="ew")
         ctk.CTkButton(paths_group, text="Mudar", width=70, command=self._browse_dl_folder).grid(row=1, column=2, padx=10, pady=6)
 
-        # Converter Folder
         ctk.CTkLabel(paths_group, text="Converter:").grid(row=2, column=0, padx=10, pady=6, sticky="w")
         self.settings_conv_label = ctk.CTkLabel(paths_group, text=self._shorten_path(self.conv_folder), text_color="gray80")
         self.settings_conv_label.grid(row=2, column=1, padx=5, pady=6, sticky="ew")
@@ -707,7 +777,6 @@ class MediaApp(BaseWindow):
 
         paths_group.grid_columnconfigure(1, weight=1)
 
-        # Secção Comportamento e Arranque
         behavior_group = ctk.CTkFrame(parent)
         behavior_group.pack(fill="x", padx=15, pady=12)
 
@@ -729,7 +798,6 @@ class MediaApp(BaseWindow):
         )
         self.startup_switch.pack(anchor="w", padx=10, pady=8)
 
-        # Info e Botão de Sair Total
         bottom_frame = ctk.CTkFrame(parent)
         bottom_frame.pack(fill="x", padx=15, pady=15)
 
