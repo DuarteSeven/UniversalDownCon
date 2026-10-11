@@ -6,3 +6,5 @@ pillow-heif>=0.15.0
 mutagen>=1.47.0
 requests>=2.31.0
 tkinterdnd2>=0.3.0
+pystray>=0.19.5
+pyinstaller>=6.0.0

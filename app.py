@@ -1,13 +1,21 @@
 import os
+import sys
 import re
-import requests
+import json
 import threading
 import subprocess
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 import yt_dlp
+import requests
+from PIL import Image, ImageDraw
+import pystray
 
-# TkinterDnD integration for drag-and-drop
+# Suporte a registo do Windows para arranque automático
+if os.name == 'nt':
+    import winreg
+
+# TkinterDnD integration para drag-and-drop
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
     HAS_DND = True
@@ -25,8 +33,63 @@ from converter import convert_media, detect_file_category, compress_video_to_siz
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
+CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".mediahub_config.json")
+STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+APP_NAME = "MediaHub"
 
-# Hybrid class allowing CustomTkinter to use TkinterDnD under the hood
+
+# Carregar e gravar configurações de utilizador
+def load_config():
+    default_dir = os.path.expanduser("~/Downloads")
+    default_config = {
+        "dl_folder": default_dir,
+        "conv_folder": default_dir,
+        "minimize_to_tray": True,
+        "start_minimized": False
+    }
+    if os.path.isfile(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                default_config.update(data)
+        except Exception:
+            pass
+    return default_config
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4)
+    except Exception:
+        pass
+
+
+def set_windows_startup(enable: bool):
+    """Regista ou remove o programa no arranque do Windows."""
+    if os.name != 'nt':
+        return
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_KEY, 0, winreg.KEY_SET_VALUE)
+        if enable:
+            if getattr(sys, 'frozen', False):
+                # Se for executável PyInstaller
+                exe_path = f'"{sys.executable}" --minimized'
+            else:
+                # Se estiver a correr via script Python
+                exe_path = f'"{sys.executable}" "{os.path.abspath(__file__)}" --minimized'
+            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, exe_path)
+        else:
+            try:
+                winreg.DeleteValue(key, APP_NAME)
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+    except Exception as e:
+        print("Erro ao definir arranque no registo:", e)
+
+
+# Classe híbrida para Drag-and-Drop
 if HAS_DND:
     class BaseWindow(ctk.CTk, TkinterDnD.DnDWrapper):
         def __init__(self, *args, **kwargs):
@@ -38,32 +101,124 @@ else:
 
 
 class MediaApp(BaseWindow):
-    def __init__(self):
+    def __init__(self, start_minimized=False):
         super().__init__()
 
+        self.config = load_config()
+
         self.title("Media Hub: Downloader & Converter")
-        self.geometry("740x630")
+        self.geometry("740x660")
         self.resizable(False, False)
 
-        # Paths state
-        self.dl_folder = os.path.expanduser("~/Downloads")
-        self.conv_folder = os.path.expanduser("~/Downloads")
+        # Pastas configuradas de forma independente
+        self.dl_folder = self.config.get("dl_folder", os.path.expanduser("~/Downloads"))
+        self.conv_folder = self.config.get("conv_folder", os.path.expanduser("~/Downloads"))
         self.selected_convert_file = ""
 
+        # Variáveis de Tray e Arranque
+        self.minimize_to_tray_var = ctk.BooleanVar(value=self.config.get("minimize_to_tray", True))
+        self.start_minimized_var = ctk.BooleanVar(value=self.config.get("start_minimized", False))
+
         # Tabview layout
-        self.tabs = ctk.CTkTabview(self, width=710, height=600)
+        self.tabs = ctk.CTkTabview(self, width=710, height=630)
         self.tabs.pack(padx=15, pady=15, fill="both", expand=True)
 
         self.tab_dl = self.tabs.add("Downloader")
         self.tab_conv = self.tabs.add("Universal Converter")
+        self.tab_settings = self.tabs.add("Definições")
 
         self._setup_downloader_tab()
         self._setup_converter_tab()
+        self._setup_settings_tab()
 
-        # Enable Drag-and-Drop if library is installed
+        # Drag and Drop
         if HAS_DND:
             self.drop_target_register(DND_FILES)
             self.dnd_bind('<<Drop>>', self._on_file_drop)
+
+        # Intercetar clique no fechar janela (X)
+        self.protocol("WM_DELETE_WINDOW", self._on_close_window)
+
+        # Inicializar Ícone do System Tray
+        self.tray_icon = None
+        self._init_system_tray()
+
+        # Iniciar minimizado se requisitado (ex: arranque do Windows)
+        if start_minimized or (self.start_minimized_var.get() and "--minimized" in sys.argv):
+            self.withdraw()
+
+    # ==========================================
+    # SYSTEM TRAY & PERSISTÊNCIA
+    # ==========================================
+    def _create_tray_image(self):
+        """Cria um ícone dinâmico azul de 64x64 para o System Tray."""
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.rounded_rectangle((4, 4, 60, 60), radius=16, fill="#1f538d")
+        draw.polygon([(24, 18), (48, 32), (24, 46)], fill="white")
+        return img
+
+    def _init_system_tray(self):
+        def on_show_window(icon, item):
+            self.after(0, self._show_window)
+
+        def toggle_tray_minimize(icon, item):
+            new_val = not self.minimize_to_tray_var.get()
+            self.minimize_to_tray_var.set(new_val)
+            self._save_settings()
+
+        def toggle_startup(icon, item):
+            new_val = not self.start_minimized_var.get()
+            self.start_minimized_var.set(new_val)
+            self._save_settings()
+
+        def on_exit_app(icon, item):
+            self.after(0, self._quit_app)
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Abrir MediaHub", on_show_window, default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "Minimizar para o Tray ao fechar",
+                toggle_tray_minimize,
+                checked=lambda item: self.minimize_to_tray_var.get()
+            ),
+            pystray.MenuItem(
+                "Iniciar com o Windows (Minimizado)",
+                toggle_startup,
+                checked=lambda item: self.start_minimized_var.get()
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Sair", on_exit_app)
+        )
+
+        self.tray_icon = pystray.Icon("MediaHub", self._create_tray_image(), "MediaHub", menu)
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def _show_window(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _on_close_window(self):
+        if self.minimize_to_tray_var.get():
+            self.withdraw()  # Esconde a janela para a barra de tarefas junto ao relógio
+        else:
+            self._quit_app()
+
+    def _quit_app(self):
+        if self.tray_icon:
+            self.tray_icon.stop()
+        self.destroy()
+        sys.exit(0)
+
+    def _save_settings(self):
+        self.config["dl_folder"] = self.dl_folder
+        self.config["conv_folder"] = self.conv_folder
+        self.config["minimize_to_tray"] = self.minimize_to_tray_var.get()
+        self.config["start_minimized"] = self.start_minimized_var.get()
+        save_config(self.config)
+        set_windows_startup(self.start_minimized_var.get())
 
     def _open_folder(self, path):
         if not os.path.exists(path):
@@ -77,19 +232,16 @@ class MediaApp(BaseWindow):
         return ("..." + path[-max_chars:]) if len(path) > max_chars else path
 
     # ==========================================
-    # DRAG AND DROP HANDLER
+    # DRAG AND DROP
     # ==========================================
     def _on_file_drop(self, event):
         raw_data = event.data.strip()
-        # Handles Windows Explorer file paths with spaces or curly braces
         if raw_data.startswith('{') and raw_data.endswith('}'):
             file_path = raw_data[1:-1]
         else:
-            # If multiple files are dropped, grab the first one
             file_path = self.tk.splitlist(raw_data)[0]
 
         if os.path.isfile(file_path):
-            # Automatically switch to the Converter tab when a local file is dropped
             self.tabs.set("Universal Converter")
             self._load_file_into_converter(file_path)
 
@@ -102,26 +254,24 @@ class MediaApp(BaseWindow):
         ctk.CTkLabel(parent, text="Web Media Downloader", font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(6, 2))
         ctk.CTkLabel(parent, text="YouTube, SoundCloud, TikTok, Instagram, X, Spotify", text_color="gray70").pack(pady=(0, 10))
 
-        # URL Entry
         url_frame = ctk.CTkFrame(parent)
         url_frame.pack(fill="x", padx=15, pady=4)
         ctk.CTkLabel(url_frame, text="URL:", font=ctk.CTkFont(weight="bold")).pack(side="left", padx=10)
-        self.dl_url_entry = ctk.CTkEntry(url_frame, placeholder_text="Paste video/audio URL here...")
+        self.dl_url_entry = ctk.CTkEntry(url_frame, placeholder_text="Cole o link do vídeo/áudio aqui...")
         self.dl_url_entry.pack(side="left", fill="x", expand=True, padx=(0, 10), pady=8)
 
-        # Type & Format
         opt_frame = ctk.CTkFrame(parent)
         opt_frame.pack(fill="x", padx=15, pady=5)
 
-        ctk.CTkLabel(opt_frame, text="Type:").grid(row=0, column=0, padx=10, pady=6, sticky="w")
+        ctk.CTkLabel(opt_frame, text="Tipo:").grid(row=0, column=0, padx=10, pady=6, sticky="w")
         self.dl_type_menu = ctk.CTkOptionMenu(opt_frame, values=["Video", "Audio Only"], command=self._on_dl_type_change)
         self.dl_type_menu.grid(row=0, column=1, padx=10, pady=6)
 
-        ctk.CTkLabel(opt_frame, text="Format:").grid(row=0, column=2, padx=10, pady=6, sticky="w")
+        ctk.CTkLabel(opt_frame, text="Formato:").grid(row=0, column=2, padx=10, pady=6, sticky="w")
         self.dl_format_menu = ctk.CTkOptionMenu(opt_frame, values=["mp4", "mkv", "webm"])
         self.dl_format_menu.grid(row=0, column=3, padx=10, pady=6)
 
-        # Compress Checkbox & Slider Row
+        # Compressão
         dl_comp_frame = ctk.CTkFrame(parent)
         dl_comp_frame.pack(fill="x", padx=15, pady=5)
 
@@ -159,26 +309,32 @@ class MediaApp(BaseWindow):
         )
         self.dl_preset_btn.grid(row=0, column=3, padx=10, pady=8)
 
-        # Folder Select
+        # Pasta de Destino (Downloader)
         folder_frame = ctk.CTkFrame(parent)
         folder_frame.pack(fill="x", padx=15, pady=5)
-        ctk.CTkLabel(folder_frame, text="Save To:").pack(side="left", padx=10)
+        ctk.CTkLabel(folder_frame, text="Guardar em:").pack(side="left", padx=10)
         self.dl_folder_label = ctk.CTkLabel(folder_frame, text=self._shorten_path(self.dl_folder), text_color="gray80")
         self.dl_folder_label.pack(side="left", fill="x", expand=True, padx=5)
 
-        ctk.CTkButton(folder_frame, text="Browse", width=70, command=self._browse_dl_folder).pack(side="left", padx=5, pady=6)
-        ctk.CTkButton(folder_frame, text="Open", width=60, fg_color="gray40", command=lambda: self._open_folder(self.dl_folder)).pack(side="left", padx=5, pady=6)
+        ctk.CTkButton(folder_frame, text="Mudar Pasta", width=90, command=self._browse_dl_folder).pack(side="left", padx=5, pady=6)
+        ctk.CTkButton(folder_frame, text="Abrir", width=60, fg_color="gray40", command=lambda: self._open_folder(self.dl_folder)).pack(side="left", padx=5, pady=6)
 
-        # Status & Progress
-        self.dl_status_label = ctk.CTkLabel(parent, text="Ready", text_color="gray60")
+        self.dl_status_label = ctk.CTkLabel(parent, text="Pronto", text_color="gray60")
         self.dl_status_label.pack(pady=(8, 2))
         self.dl_progress = ctk.CTkProgressBar(parent)
         self.dl_progress.set(0)
         self.dl_progress.pack(fill="x", padx=15, pady=4)
 
-        # Download Button
-        self.dl_btn = ctk.CTkButton(parent, text="Download Media", font=ctk.CTkFont(weight="bold"), height=38, command=self._start_download)
+        self.dl_btn = ctk.CTkButton(parent, text="Descarregar Média", font=ctk.CTkFont(weight="bold"), height=38, command=self._start_download)
         self.dl_btn.pack(fill="x", padx=15, pady=10)
+
+    def _browse_dl_folder(self):
+        folder = filedialog.askdirectory(initialdir=self.dl_folder)
+        if folder:
+            self.dl_folder = folder
+            self.dl_folder_label.configure(text=self._shorten_path(folder))
+            self.settings_dl_label.configure(text=self._shorten_path(folder))
+            self._save_settings()
 
     def _toggle_dl_compress(self):
         active = self.dl_compress_var.get()
@@ -187,12 +343,6 @@ class MediaApp(BaseWindow):
 
     def _on_dl_slider_change(self, val):
         self.dl_size_label.configure(text=f"{int(val)} MB")
-
-    def _browse_dl_folder(self):
-        folder = filedialog.askdirectory(initialdir=self.dl_folder)
-        if folder:
-            self.dl_folder = folder
-            self.dl_folder_label.configure(text=self._shorten_path(folder))
 
     def _on_dl_type_change(self, choice):
         if choice == "Audio Only":
@@ -221,13 +371,6 @@ class MediaApp(BaseWindow):
             self.conv_size_label.configure(text="19 MB")
 
     def _resolve_spotify_track(self, url: str) -> str:
-        """
-        Extrai o artista e título reais através da página pública embed do Spotify
-        (que nunca bloqueia scraping) e seleciona o vídeo exato no YouTube.
-        """
-        import json
-        
-        # 1. Extrair o ID da faixa a partir do URL (ex: 4heaLu6Y8zvYzQQaEQ8iEB)
         match = re.search(r'track/([a-zA-Z0-9]+)', url)
         if not match:
             raise RuntimeError("URL do Spotify inválido.")
@@ -235,17 +378,11 @@ class MediaApp(BaseWindow):
 
         track_title = ""
         artist_name = ""
-
-        # 2. Consultar a página embed pública (aberta e sem proteções anti-bot)
-        embed_url = f"https://open.spotify.com/embed/track/{track_id}"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
         try:
-            r = requests.get(embed_url, headers=headers, timeout=10)
+            r = requests.get(f"https://open.spotify.com/embed/track/{track_id}", headers=headers, timeout=10)
             if r.status_code == 200:
-                # O Spotify guarda os dados no script __NEXT_DATA__ ou num JSON escapado dentro do HTML
                 data_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', r.text)
                 if data_match:
                     js = json.loads(data_match.group(1))
@@ -254,24 +391,16 @@ class MediaApp(BaseWindow):
                     artists = entity.get('artists', [])
                     if artists:
                         artist_name = artists[0].get('name', '')
-
-                # Fallback: Extrair diretamente da tag <title> do embed (formato: "Título - Artista | Spotify")
                 if not track_title:
                     title_tag = re.search(r'<title>(.*?)</title>', r.text)
                     if title_tag:
                         full_t = title_tag.group(1).replace(" | Spotify", "").replace("Spotify – ", "").strip()
                         if " - " in full_t:
                             parts = full_t.split(" - ")
-                            track_title = parts[0].strip()
-                            artist_name = parts[1].strip()
-                        elif " by " in full_t:
-                            parts = full_t.split(" by ")
-                            track_title = parts[0].strip()
-                            artist_name = parts[1].strip()
+                            track_title, artist_name = parts[0].strip(), parts[1].strip()
         except Exception:
             pass
 
-        # 3. Se ainda não tiver os dados, tentar o endpoint oficial oEmbed
         if not track_title:
             try:
                 res = requests.get(f"https://open.spotify.com/oembed?url=https://open.spotify.com/track/{track_id}", headers=headers, timeout=10)
@@ -281,34 +410,24 @@ class MediaApp(BaseWindow):
                 pass
 
         if not track_title:
-            raise RuntimeError("Não foi possível obter os dados da música do Spotify.")
+            raise RuntimeError("Não foi possível obter dados da música do Spotify.")
 
-        # Montar a pesquisa explícita no YouTube
-        if artist_name:
-            query = f"ytsearch1:{artist_name} {track_title}"
-        else:
-            query = f"ytsearch1:{track_title}"
-
-        # Atualiza a mensagem na interface para saberes exatamente o que está a ser pesquisado
-        self.after(0, lambda: self.dl_status_label.configure(
-            text=f"A pesquisar: {artist_name} - {track_title}",
-            text_color="gray70"
-        ))
-
+        query = f"ytsearch1:{artist_name} {track_title}" if artist_name else f"ytsearch1:{track_title}"
+        self.after(0, lambda: self.dl_status_label.configure(text=f"A pesquisar: {artist_name} - {track_title}", text_color="gray70"))
         return query
 
     def _start_download(self):
         url = self.dl_url_entry.get().strip()
         if not url:
-            messagebox.showwarning("Warning", "Please enter a valid URL.")
+            messagebox.showwarning("Aviso", "Por favor insira um URL válido.")
             return
 
         if "open.spotify.com/track" in url or "spotify.com/intl-" in url:
-            self.dl_status_label.configure(text="Resolving Spotify track...", text_color="gray70")
+            self.dl_status_label.configure(text="A identificar faixa do Spotify...", text_color="gray70")
             try:
                 url = self._resolve_spotify_track(url)
             except Exception as err:
-                messagebox.showerror("Spotify Error", str(err))
+                messagebox.showerror("Erro Spotify", str(err))
                 return
 
         if "&list=" in url:
@@ -316,8 +435,8 @@ class MediaApp(BaseWindow):
         if "music.youtube.com" in url:
             url = url.replace("music.youtube.com", "www.youtube.com")
 
-        self.dl_btn.configure(state="disabled", text="Processing...")
-        self.dl_status_label.configure(text="Connecting...", text_color="gray70")
+        self.dl_btn.configure(state="disabled", text="A processar...")
+        self.dl_status_label.configure(text="A conectar...", text_color="gray70")
         self.dl_progress.set(0)
 
         threading.Thread(target=self._run_downloader, args=(url,), daemon=True).start()
@@ -334,9 +453,9 @@ class MediaApp(BaseWindow):
                 ratio = cur / tot
                 pct = int(ratio * 100)
                 self.after(0, lambda: self.dl_progress.set(ratio))
-                self.after(0, lambda: self.dl_status_label.configure(text=f"Downloading: {pct}%"))
+                self.after(0, lambda: self.dl_status_label.configure(text=f"A transferir: {pct}%"))
             elif d['status'] == 'finished':
-                self.after(0, lambda: self.dl_status_label.configure(text="Processing / Merging with FFmpeg..."))
+                self.after(0, lambda: self.dl_status_label.configure(text="A processar / Juntar com FFmpeg..."))
 
         ydl_opts = {
             'outtmpl': outtmpl,
@@ -377,7 +496,7 @@ class MediaApp(BaseWindow):
 
             if mode != "Audio Only" and self.dl_compress_var.get() and os.path.isfile(downloaded_file):
                 target_mb = float(self.dl_slider.get())
-                self.after(0, lambda: self.dl_status_label.configure(text=f"Compressing under {int(target_mb)}MB..."))
+                self.after(0, lambda: self.dl_status_label.configure(text=f"A comprimir para < {int(target_mb)}MB..."))
                 compress_video_to_size(downloaded_file, target_mb=target_mb)
 
             self.after(0, self._on_dl_success)
@@ -385,15 +504,15 @@ class MediaApp(BaseWindow):
             self.after(0, lambda: self._on_dl_error(str(e)))
 
     def _on_dl_success(self):
-        self.dl_btn.configure(state="normal", text="Download Media")
-        self.dl_status_label.configure(text="Download Complete!", text_color="#2ecc71")
+        self.dl_btn.configure(state="normal", text="Descarregar Média")
+        self.dl_status_label.configure(text="Download Concluído!", text_color="#2ecc71")
         self.dl_progress.set(1.0)
-        messagebox.showinfo("Success", "Download finished successfully!")
+        messagebox.showinfo("Sucesso", "Download terminado com sucesso!")
 
     def _on_dl_error(self, err):
-        self.dl_btn.configure(state="normal", text="Download Media")
-        self.dl_status_label.configure(text="Download Failed", text_color="#e74c3c")
-        messagebox.showerror("Error", err)
+        self.dl_btn.configure(state="normal", text="Descarregar Média")
+        self.dl_status_label.configure(text="Erro no Download", text_color="#e74c3c")
+        messagebox.showerror("Erro", err)
 
     # ==========================================
     # TAB 2: UNIVERSAL CONVERTER
@@ -402,24 +521,22 @@ class MediaApp(BaseWindow):
         parent = self.tab_conv
 
         ctk.CTkLabel(parent, text="Universal File Converter", font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(6, 2))
-        hint_text = "Drag & drop files directly here, or click Choose File" if HAS_DND else "Convert local Images, Audio, or Videos with optional compression"
+        hint_text = "Arrasta ficheiros diretamente para aqui ou clica em Escolher Ficheiro" if HAS_DND else "Converte ficheiros locais com compressão opcional"
         ctk.CTkLabel(parent, text=hint_text, text_color="gray70").pack(pady=(0, 10))
 
-        # File Select Box
         file_frame = ctk.CTkFrame(parent)
         file_frame.pack(fill="x", padx=15, pady=4)
-        self.conv_file_label = ctk.CTkLabel(file_frame, text="Drag a file here or Choose File...", text_color="gray70")
+        self.conv_file_label = ctk.CTkLabel(file_frame, text="Nenhum ficheiro selecionado", text_color="gray70")
         self.conv_file_label.pack(side="left", fill="x", expand=True, padx=10, pady=8)
-        ctk.CTkButton(file_frame, text="Choose File", width=100, command=self._select_convert_file).pack(side="right", padx=10, pady=8)
+        ctk.CTkButton(file_frame, text="Escolher Ficheiro", width=120, command=self._select_convert_file).pack(side="right", padx=10, pady=8)
 
-        # Output Format Choice
         conv_opt_frame = ctk.CTkFrame(parent)
         conv_opt_frame.pack(fill="x", padx=15, pady=5)
-        ctk.CTkLabel(conv_opt_frame, text="Target Format:").pack(side="left", padx=10, pady=8)
-        self.conv_target_format = ctk.CTkOptionMenu(conv_opt_frame, values=["Select a file first"])
+        ctk.CTkLabel(conv_opt_frame, text="Formato Alvo:").pack(side="left", padx=10, pady=8)
+        self.conv_target_format = ctk.CTkOptionMenu(conv_opt_frame, values=["Selecione um ficheiro primeiro"])
         self.conv_target_format.pack(side="left", padx=10, pady=8)
 
-        # Compress Checkbox & Slider Row (Converter)
+        # Compressão (Converter)
         conv_comp_frame = ctk.CTkFrame(parent)
         conv_comp_frame.pack(fill="x", padx=15, pady=5)
 
@@ -459,23 +576,29 @@ class MediaApp(BaseWindow):
         )
         self.conv_preset_btn.grid(row=0, column=3, padx=10, pady=8)
 
-        # Save Folder Selection
+        # Pasta de Destino (Converter)
         conv_folder_frame = ctk.CTkFrame(parent)
         conv_folder_frame.pack(fill="x", padx=15, pady=5)
-        ctk.CTkLabel(conv_folder_frame, text="Save To:").pack(side="left", padx=10)
+        ctk.CTkLabel(conv_folder_frame, text="Guardar em:").pack(side="left", padx=10)
         self.conv_folder_label = ctk.CTkLabel(conv_folder_frame, text=self._shorten_path(self.conv_folder), text_color="gray80")
         self.conv_folder_label.pack(side="left", fill="x", expand=True, padx=5)
 
-        ctk.CTkButton(conv_folder_frame, text="Browse", width=70, command=self._browse_conv_folder).pack(side="left", padx=5, pady=6)
-        ctk.CTkButton(conv_folder_frame, text="Open", width=60, fg_color="gray40", command=lambda: self._open_folder(self.conv_folder)).pack(side="left", padx=5, pady=6)
+        ctk.CTkButton(conv_folder_frame, text="Mudar Pasta", width=90, command=self._browse_conv_folder).pack(side="left", padx=5, pady=6)
+        ctk.CTkButton(conv_folder_frame, text="Abrir", width=60, fg_color="gray40", command=lambda: self._open_folder(self.conv_folder)).pack(side="left", padx=5, pady=6)
 
-        # Status Label
-        self.conv_status_label = ctk.CTkLabel(parent, text="Ready", text_color="gray60")
+        self.conv_status_label = ctk.CTkLabel(parent, text="Pronto", text_color="gray60")
         self.conv_status_label.pack(pady=(8, 2))
 
-        # Convert Action Button
-        self.conv_btn = ctk.CTkButton(parent, text="Convert File", font=ctk.CTkFont(weight="bold"), height=38, command=self._start_conversion)
+        self.conv_btn = ctk.CTkButton(parent, text="Converter Ficheiro", font=ctk.CTkFont(weight="bold"), height=38, command=self._start_conversion)
         self.conv_btn.pack(fill="x", padx=15, pady=10)
+
+    def _browse_conv_folder(self):
+        folder = filedialog.askdirectory(initialdir=self.conv_folder)
+        if folder:
+            self.conv_folder = folder
+            self.conv_folder_label.configure(text=self._shorten_path(folder))
+            self.settings_conv_label.configure(text=self._shorten_path(folder))
+            self._save_settings()
 
     def _toggle_conv_compress(self):
         active = self.conv_compress_var.get()
@@ -518,24 +641,18 @@ class MediaApp(BaseWindow):
         self.conv_compress_checkbox.configure(state="disabled")
         self.conv_preset_btn.configure(state="disabled")
 
-    def _browse_conv_folder(self):
-        folder = filedialog.askdirectory(initialdir=self.conv_folder)
-        if folder:
-            self.conv_folder = folder
-            self.conv_folder_label.configure(text=self._shorten_path(folder))
-
     def _start_conversion(self):
         if not self.selected_convert_file or not os.path.isfile(self.selected_convert_file):
-            messagebox.showwarning("Warning", "Please select a file to convert.")
+            messagebox.showwarning("Aviso", "Por favor selecione um ficheiro para converter.")
             return
 
         fmt = self.conv_target_format.get()
-        if fmt in ["Select a file first", "Unsupported"]:
-            messagebox.showwarning("Warning", "Please select a valid target format.")
+        if fmt in ["Selecione um ficheiro primeiro", "Unsupported"]:
+            messagebox.showwarning("Aviso", "Por favor selecione um formato válido.")
             return
 
-        self.conv_btn.configure(state="disabled", text="Converting...")
-        self.conv_status_label.configure(text="Processing file...", text_color="gray70")
+        self.conv_btn.configure(state="disabled", text="A converter...")
+        self.conv_status_label.configure(text="A processar ficheiro...", text_color="gray70")
 
         threading.Thread(target=self._run_conversion, args=(self.selected_convert_file, self.conv_folder, fmt), daemon=True).start()
 
@@ -545,7 +662,7 @@ class MediaApp(BaseWindow):
 
             if detect_file_category(out_file) == 'video' and self.conv_compress_var.get():
                 target_mb = float(self.conv_slider.get())
-                self.after(0, lambda: self.conv_status_label.configure(text=f"Compressing under {int(target_mb)}MB..."))
+                self.after(0, lambda: self.conv_status_label.configure(text=f"A comprimir para < {int(target_mb)}MB..."))
                 compress_video_to_size(out_file, target_mb=target_mb)
 
             self.after(0, lambda: self._on_conv_success(out_file))
@@ -553,16 +670,86 @@ class MediaApp(BaseWindow):
             self.after(0, lambda: self._on_conv_error(str(e)))
 
     def _on_conv_success(self, out_file):
-        self.conv_btn.configure(state="normal", text="Convert File")
-        self.conv_status_label.configure(text="Converted successfully!", text_color="#2ecc71")
-        messagebox.showinfo("Success", f"File saved to:\n{out_file}")
+        self.conv_btn.configure(state="normal", text="Converter Ficheiro")
+        self.conv_status_label.configure(text="Convertido com sucesso!", text_color="#2ecc71")
+        messagebox.showinfo("Sucesso", f"Ficheiro guardado em:\n{out_file}")
 
     def _on_conv_error(self, err):
-        self.conv_btn.configure(state="normal", text="Convert File")
-        self.conv_status_label.configure(text="Conversion failed.", text_color="#e74c3c")
-        messagebox.showerror("Conversion Error", err)
+        self.conv_btn.configure(state="normal", text="Converter Ficheiro")
+        self.conv_status_label.configure(text="Erro na conversão.", text_color="#e74c3c")
+        messagebox.showerror("Erro na Conversão", err)
+
+    # ==========================================
+    # TAB 3: DEFINIÇÕES (PASTAS & COMPORTAMENTO)
+    # ==========================================
+    def _setup_settings_tab(self):
+        parent = self.tab_settings
+
+        ctk.CTkLabel(parent, text="Definições da Aplicação", font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(10, 15))
+
+        # Secção de Pastas Padrão
+        paths_group = ctk.CTkFrame(parent)
+        paths_group.pack(fill="x", padx=15, pady=8)
+
+        ctk.CTkLabel(paths_group, text="Pastas Padrão (Independentes)", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, columnspan=3, padx=10, pady=8, sticky="w")
+
+        # Downloader Folder
+        ctk.CTkLabel(paths_group, text="Downloader:").grid(row=1, column=0, padx=10, pady=6, sticky="w")
+        self.settings_dl_label = ctk.CTkLabel(paths_group, text=self._shorten_path(self.dl_folder), text_color="gray80")
+        self.settings_dl_label.grid(row=1, column=1, padx=5, pady=6, sticky="ew")
+        ctk.CTkButton(paths_group, text="Mudar", width=70, command=self._browse_dl_folder).grid(row=1, column=2, padx=10, pady=6)
+
+        # Converter Folder
+        ctk.CTkLabel(paths_group, text="Converter:").grid(row=2, column=0, padx=10, pady=6, sticky="w")
+        self.settings_conv_label = ctk.CTkLabel(paths_group, text=self._shorten_path(self.conv_folder), text_color="gray80")
+        self.settings_conv_label.grid(row=2, column=1, padx=5, pady=6, sticky="ew")
+        ctk.CTkButton(paths_group, text="Mudar", width=70, command=self._browse_conv_folder).grid(row=2, column=2, padx=10, pady=6)
+
+        paths_group.grid_columnconfigure(1, weight=1)
+
+        # Secção Comportamento e Arranque
+        behavior_group = ctk.CTkFrame(parent)
+        behavior_group.pack(fill="x", padx=15, pady=12)
+
+        ctk.CTkLabel(behavior_group, text="Comportamento e Bandeja do Sistema", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(8, 4))
+
+        self.tray_switch = ctk.CTkSwitch(
+            behavior_group,
+            text="Minimizar para a bandeja do sistema ao fechar (ícone junto ao relógio)",
+            variable=self.minimize_to_tray_var,
+            command=self._save_settings
+        )
+        self.tray_switch.pack(anchor="w", padx=10, pady=8)
+
+        self.startup_switch = ctk.CTkSwitch(
+            behavior_group,
+            text="Iniciar minimizado com o arranque do Windows",
+            variable=self.start_minimized_var,
+            command=self._save_settings
+        )
+        self.startup_switch.pack(anchor="w", padx=10, pady=8)
+
+        # Info e Botão de Sair Total
+        bottom_frame = ctk.CTkFrame(parent)
+        bottom_frame.pack(fill="x", padx=15, pady=15)
+
+        ctk.CTkLabel(
+            bottom_frame,
+            text="Dica: Podes clicar com o botão direito no ícone junto à bateria/relógio\npara alternar estas opções a qualquer momento ou fechar a app.",
+            text_color="gray70",
+            justify="left"
+        ).pack(side="left", padx=10, pady=10)
+
+        ctk.CTkButton(
+            bottom_frame,
+            text="Encerrar Totalmente",
+            fg_color="#e74c3c",
+            hover_color="#c0392b",
+            command=self._quit_app
+        ).pack(side="right", padx=10, pady=10)
 
 
 if __name__ == "__main__":
-    app = MediaApp()
+    start_min = "--minimized" in sys.argv
+    app = MediaApp(start_minimized=start_min)
     app.mainloop()
