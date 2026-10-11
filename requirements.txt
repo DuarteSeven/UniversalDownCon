@@ -1,0 +1,7 @@
+customtkinter>=5.2.0
+yt-dlp>=2024.0.0
+Pillow>=10.0.0
+static-ffmpeg>=2.5
+pillow-heif>=0.15.0
+mutagen>=1.47.0
+requests>=2.31.0
