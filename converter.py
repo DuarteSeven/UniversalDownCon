@@ -206,7 +206,7 @@ def compress_video_to_size(input_file: str, target_mb: float = 19.0, gif_mode: s
 
     return input_file
 
-def convert_media(input_path: str, output_dir: str, target_format: str, progress_callback=None) -> str:
+def convert_media(input_path: str, output_dir: str, target_format: str, legacy_webm: bool = False, progress_callback=None) -> str:
     """
     Conversão com fidelidade máxima. Sem compressão ativa, preserva todos os fotogramas.
     """
@@ -265,7 +265,10 @@ def convert_media(input_path: str, output_dir: str, target_format: str, progress
             if target_format in ['mp4', 'mkv', 'mov']:
                 cmd.extend(['-c:v', 'libx264', '-crf', '18', '-preset', 'medium', '-c:a', 'aac', '-b:a', '256k'])
             elif target_format == 'webm':
-                cmd.extend(['-c:v', 'libvpx-vp9', '-crf', '24', '-b:v', '0', '-c:a', 'libopus'])
+                if legacy_webm:
+                    cmd.extend(['-c:v', 'libvpx', '-crf', '10', '-b:v', '2M', '-c:a', 'libvorbis', '-q:a', '4'])
+                else:
+                    cmd.extend(['-c:v', 'libvpx-vp9', '-crf', '24', '-b:v', '0', '-c:a', 'libopus'])
             elif target_format == 'avi':
                 cmd.extend(['-c:v', 'mpeg4', '-qscale:v', '2', '-c:a', 'mp3'])
             else:

@@ -306,8 +306,16 @@ class MediaApp(BaseWindow):
         self.dl_type_menu.grid(row=0, column=1, padx=10, pady=6)
 
         ctk.CTkLabel(opt_frame, text="Formato:").grid(row=0, column=2, padx=10, pady=6, sticky="w")
-        self.dl_format_menu = ctk.CTkOptionMenu(opt_frame, values=["mp4", "mkv", "webm"])
+        self.dl_format_menu = ctk.CTkOptionMenu(opt_frame, values=["mp4", "mkv", "webm"], command=self._on_dl_format_changed)
         self.dl_format_menu.grid(row=0, column=3, padx=10, pady=6)
+
+        # Checkbox WebM Legacy para Downloader
+        self.dl_legacy_webm_var = ctk.BooleanVar(value=False)
+        self.dl_legacy_webm_cb = ctk.CTkCheckBox(
+            opt_frame,
+            text="Legacy/MV (VP8)",
+            variable=self.dl_legacy_webm_var
+        )
 
         # Compressão
         dl_comp_frame = ctk.CTkFrame(parent)
@@ -382,6 +390,15 @@ class MediaApp(BaseWindow):
     def _on_dl_slider_change(self, val):
         self.dl_size_label.configure(text=f"{int(val)} MB")
 
+    def _update_dl_legacy_webm_visibility(self):
+        if self.dl_type_menu.get() == "Video" and self.dl_format_menu.get() == "webm":
+            self.dl_legacy_webm_cb.grid(row=0, column=4, padx=10, pady=6)
+        else:
+            self.dl_legacy_webm_cb.grid_forget()
+
+    def _on_dl_format_changed(self, choice):
+        self._update_dl_legacy_webm_visibility()
+
     def _on_dl_type_change(self, choice):
         if choice == "Audio Only":
             self.dl_format_menu.configure(values=["mp3", "wav", "ogg", "flac", "m4a"])
@@ -395,6 +412,7 @@ class MediaApp(BaseWindow):
             self.dl_format_menu.set("mp4")
             self.dl_compress_checkbox.configure(state="normal")
             self.dl_preset_btn.configure(state="normal")
+        self._update_dl_legacy_webm_visibility()
 
     def _set_discord_preset(self, target):
         if target == "dl":
@@ -516,7 +534,13 @@ class MediaApp(BaseWindow):
                 ],
             })
         else:
-            merger_args = ['-c:v', 'copy', '-c:a', 'copy'] if fmt in ['mkv', 'webm'] else ['-c:v', 'copy', '-c:a', 'aac', '-b:a', '256k']
+            if fmt == 'webm' and self.dl_legacy_webm_var.get():
+                merger_args = ['-c:v', 'libvpx', '-crf', '10', '-b:v', '2M', '-c:a', 'libvorbis', '-q:a', '4']
+            elif fmt in ['mkv', 'webm']:
+                merger_args = ['-c:v', 'copy', '-c:a', 'copy']
+            else:
+                merger_args = ['-c:v', 'copy', '-c:a', 'aac', '-b:a', '256k']
+
             ydl_opts.update({
                 'format': 'bestvideo*+bestaudio/best',
                 'merge_output_format': fmt,
@@ -570,11 +594,13 @@ class MediaApp(BaseWindow):
         self.conv_file_label.pack(side="left", fill="x", expand=True, padx=10, pady=8)
         ctk.CTkButton(file_frame, text="Escolher Ficheiro", width=120, command=self._select_convert_file).pack(side="right", padx=10, pady=8)
 
-        # Formato e Opção contextual de GIF
+        # Formato e Opções contextuais (GIF / WebM Legacy)
         self.conv_opt_frame = ctk.CTkFrame(parent)
         self.conv_opt_frame.pack(fill="x", padx=15, pady=5)
 
         ctk.CTkLabel(self.conv_opt_frame, text="Formato Alvo:").pack(side="left", padx=(10, 5), pady=8)
+        
+        # Menu de formatos
         self.conv_target_format = ctk.CTkOptionMenu(
             self.conv_opt_frame,
             values=["Selecione um ficheiro primeiro"],
@@ -589,6 +615,14 @@ class MediaApp(BaseWindow):
             width=160
         )
         self.conv_gif_mode_menu.set("Balanced")
+
+        # Checkbox contextual para WebM Legacy/MV
+        self.conv_legacy_webm_var = ctk.BooleanVar(value=False)
+        self.conv_legacy_webm_cb = ctk.CTkCheckBox(
+            self.conv_opt_frame,
+            text="Legacy/MV (VP8)",
+            variable=self.conv_legacy_webm_var
+        )
 
         # Compressão (Converter)
         conv_comp_frame = ctk.CTkFrame(parent)
@@ -646,18 +680,27 @@ class MediaApp(BaseWindow):
         self.conv_btn = ctk.CTkButton(parent, text="Converter Ficheiro", font=ctk.CTkFont(weight="bold"), height=38, command=self._start_conversion)
         self.conv_btn.pack(fill="x", padx=15, pady=10)
 
-    def _update_gif_mode_visibility(self):
-        """Mostra a opção de Compress Quality/Frames apenas se for GIF e estiver a comprimir."""
-        is_gif = self.conv_target_format.get().lower() == "gif"
+    def _update_converter_contextual_options(self):
+        """Atualiza a visibilidade das opções de GIF e WebM Legacy."""
+        fmt = self.conv_target_format.get().lower()
+        is_gif = (fmt == "gif")
+        is_webm = (fmt == "webm")
         is_comp = self.conv_compress_var.get()
 
+        # Mostra/esconde opções de GIF
         if is_gif and is_comp:
             self.conv_gif_mode_menu.pack(side="left", padx=10, pady=8)
         else:
             self.conv_gif_mode_menu.pack_forget()
 
+        # Mostra/esconde opção de WebM Legacy (VP8)
+        if is_webm:
+            self.conv_legacy_webm_cb.pack(side="left", padx=10, pady=8)
+        else:
+            self.conv_legacy_webm_cb.pack_forget()
+
     def _on_conv_format_changed(self, choice):
-        self._update_gif_mode_visibility()
+        self._update_converter_contextual_options()
 
     def _browse_conv_folder(self):
         folder = filedialog.askdirectory(initialdir=self.conv_folder)
@@ -671,7 +714,7 @@ class MediaApp(BaseWindow):
         active = self.conv_compress_var.get()
         self.conv_slider.configure(state="normal" if active else "disabled")
         self.conv_size_label.configure(text_color="white" if active else "gray50")
-        self._update_gif_mode_visibility()
+        self._update_converter_contextual_options()
 
     def _on_conv_slider_change(self, val):
         self.conv_size_label.configure(text=f"{int(val)} MB")
@@ -696,7 +739,7 @@ class MediaApp(BaseWindow):
 
         self.conv_target_format.configure(values=options)
         self.conv_target_format.set(options[0])
-        self._update_gif_mode_visibility()
+        self._update_converter_contextual_options()
 
     def _select_convert_file(self):
         file_path = filedialog.askopenfilename()
@@ -727,7 +770,8 @@ class MediaApp(BaseWindow):
 
     def _run_conversion(self, input_path, out_dir, fmt):
         try:
-            out_file = convert_media(input_path, out_dir, fmt)
+            legacy_mode = self.conv_legacy_webm_var.get() if fmt.lower() == 'webm' else False
+            out_file = convert_media(input_path, out_dir, fmt, legacy_webm=legacy_mode)
 
             if detect_file_category(out_file) == 'video' and self.conv_compress_var.get():
                 target_mb = float(self.conv_slider.get())
