@@ -70,33 +70,47 @@ def compress_video_to_size(input_file: str, target_mb: float = 19.0, gif_mode: s
 
     ext = os.path.splitext(input_file)[1].lower()
 
-    # --- COMPRESSÃO DE GIF ---
+# --- COMPRESSÃO INTELIGENTE DE GIF ---
     if ext == '.gif':
         base = os.path.splitext(input_file)[0]
         temp_gif = f"{base}_temp_comp.gif"
+        
+        duration = _get_duration(input_file, startupinfo)
+        if duration <= 0:
+            duration = 10.0
 
-        if gif_mode == "frames":
-            profiles = [
-                {"fps": 15, "scale": 480, "max_colors": 256},
-                {"fps": 12, "scale": 420, "max_colors": 192},
-                {"fps": 10, "scale": 380, "max_colors": 128},
-                {"fps": 8,  "scale": 320, "max_colors": 96},
-                {"fps": 6,  "scale": 280, "max_colors": 64},
-            ]
-        else:
-            # Modo 'quality' (Fluidez prioritária)
-            profiles = [
-                {"fps": 24, "scale": 380, "max_colors": 128},
-                {"fps": 20, "scale": 320, "max_colors": 96},
-                {"fps": 18, "scale": 260, "max_colors": 64},
-                {"fps": 16, "scale": 200, "max_colors": 48},
-            ]
+        # Orçamento de bytes/s
+        bytes_per_sec = (target_mb * 1024 * 1024 * 0.85) / duration
 
-        for p in profiles:
+        if gif_mode == "frames":  # Prioritize Sharpness
+            if bytes_per_sec > 1_500_000:
+                steps = [(480, 16, 128), (420, 12, 96), (360, 10, 64)]
+            elif bytes_per_sec > 700_000:
+                steps = [(400, 12, 96), (320, 10, 64), (260, 8, 48)]
+            else:
+                steps = [(320, 10, 64), (240, 8, 48), (200, 6, 32), (160, 5, 24)]
+
+        elif gif_mode == "smooth":  # Prioritize Smoothness
+            if bytes_per_sec > 1_500_000:
+                steps = [(380, 24, 128), (320, 22, 96), (260, 20, 64)]
+            elif bytes_per_sec > 700_000:
+                steps = [(300, 20, 96), (240, 18, 64), (200, 15, 48)]
+            else:
+                steps = [(220, 18, 64), (180, 15, 48), (140, 12, 32), (120, 10, 24)]
+
+        else:  # "balanced" (Default inteligente)
+            if bytes_per_sec > 1_500_000:
+                steps = [(420, 20, 128), (360, 18, 96), (300, 15, 64)]
+            elif bytes_per_sec > 700_000:
+                steps = [(340, 16, 96), (280, 14, 64), (240, 12, 48)]
+            else:
+                steps = [(260, 12, 64), (200, 10, 48), (160, 8, 32), (140, 6, 24)]
+
+        for width, fps, colors in steps:
             vf = (
-                f"fps={p['fps']},scale={p['scale']}:-1:flags=lanczos,"
+                f"fps={fps},scale={width}:-1:flags=lanczos,"
                 f"split[s0][s1];"
-                f"[s0]palettegen=max_colors={p['max_colors']}:stats_mode=diff[p];"
+                f"[s0]palettegen=max_colors={colors}:stats_mode=diff[p];"
                 f"[s1][p]paletteuse=dither=bayer:bayer_scale=3"
             )
             subprocess.run([
@@ -106,6 +120,14 @@ def compress_video_to_size(input_file: str, target_mb: float = 19.0, gif_mode: s
 
             if os.path.exists(temp_gif) and (os.path.getsize(temp_gif) / (1024 * 1024)) <= target_mb:
                 break
+
+        # Garantia final para ficheiros extremos
+        if os.path.exists(temp_gif) and (os.path.getsize(temp_gif) / (1024 * 1024)) > target_mb:
+            vf = "fps=8,scale=160:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=32[p];[s1][p]paletteuse"
+            subprocess.run([
+                'ffmpeg', '-y', '-i', input_file,
+                '-vf', vf, temp_gif
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, startupinfo=startupinfo)
 
         if os.path.exists(temp_gif) and os.path.getsize(temp_gif) > 0:
             os.replace(temp_gif, input_file)

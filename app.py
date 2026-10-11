@@ -585,10 +585,10 @@ class MediaApp(BaseWindow):
         # Seletor contextual de compressão para GIFs
         self.conv_gif_mode_menu = ctk.CTkOptionMenu(
             self.conv_opt_frame,
-            values=["Compress Quality", "Compress Frames"],
-            width=150
+            values=["Balanced", "Compress Quality", "Compress Frames"],
+            width=160
         )
-        self.conv_gif_mode_menu.set("Compress Quality")
+        self.conv_gif_mode_menu.set("Balanced")
 
         # Compressão (Converter)
         conv_comp_frame = ctk.CTkFrame(parent)
@@ -733,7 +733,14 @@ class MediaApp(BaseWindow):
                 target_mb = float(self.conv_slider.get())
                 self.after(0, lambda: self.conv_status_label.configure(text=f"A comprimir para < {int(target_mb)}MB..."))
                 
-                gif_mode = "frames" if self.conv_gif_mode_menu.get() == "Compress Frames" else "quality"
+                selected_label = self.conv_gif_mode_menu.get()
+                if selected_label == "Compress Frames":
+                    gif_mode = "frames"
+                elif selected_label == "Compress Quality":
+                    gif_mode = "quality"
+                else:
+                    gif_mode = "balanced"
+
                 compress_video_to_size(out_file, target_mb=target_mb, gif_mode=gif_mode)
 
             self.after(0, lambda: self._on_conv_success(out_file))
